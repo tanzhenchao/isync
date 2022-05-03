@@ -1,6 +1,6 @@
 #!/bin/bash
 
-targetServers="node02 node03"
+targetServers="node02;node03"
 sourceDir="/data"
 targetDir="/data"
 threadNo="10"
