@@ -1,0 +1,268 @@
+#!/bin/bash
+
+targetServers="node02 node03"
+sourceDir="/data"
+targetDir="/data"
+threadNo="10"
+
+isyncLog="/var/log/isync/isync.log"
+inotifywaitPipo="/var/run/isync/inotifywait"
+isyncPipo="/var/run/isync/isync"
+isyncPid="/var/run/isync/isync.pid"
+
+execRsync() {
+	syncSourcet="$1"
+	targetSer="$2"
+	syncTarget="$3"
+	watchEvent="$4"
+
+	executeFile=`echo "$syncTarget" | sed -e "s~$targetDir/~~g"`
+	excludeFile=`echo $executeFile | sed 's/[^/*/$]/\*/g' | tr -s '*'`
+
+	finsh=false
+	case "$watchEvent" in
+		DELETE|DELETE,ISDIR)
+			rsync -azs --delete --include="$executeFile" --exclude="$excludeFile" \
+			      "$sourceDir/" "$targetSer:$targetDir/" > /dev/null 2>&1
+			if [ $? -eq 0 ]; then finsh=true; fi
+			;;
+		MOVED_FROM|MOVED_FROM,ISDIR)
+			rsync -azs --delete --include="$executeFile" --exclude="$excludeFile" \
+			      "$sourceDir/" "$targetSer:$targetDir/" > /dev/null 2>&1
+			if [ $? -eq 0 ]; then finsh=true; fi
+			;;
+		MOVED_TO|MOVED_TO,ISDIR)
+			rsync -azs --delete --include="$executeFile" --exclude="$excludeFile" \
+			      "$sourceDir/" "$targetSer:$targetDir/" > /dev/null 2>&1
+			if [ $? -eq 0 ]; then finsh=true; fi
+			;;
+		CREATE,ISDIR)
+			if ! [ -a "$syncSourcet" ]; then finsh=true; break; fi
+			rsync -azs --delete "$syncSourcet/" "$targetSer:$syncTarget/" > /dev/null 2>&1
+			if [ $? -eq 0 ]; then finsh=true; fi
+			;;
+		*)
+			if ! [ -a "$syncSourcet" ]; then finsh=true; break; fi
+			rsync -azs --delete "$syncSourcet" "$targetSer:$syncTarget" > /dev/null 2>&1
+			if [ $? -eq 0 ]; then finsh=true; fi
+			;;
+	esac
+	if [ $finsh == true ]; then return 0; else return 1; fi
+
+}
+
+touchPipo() {
+	pipoFile="$1"
+	if ! [ -d `dirname "$pipoFile"` ]; then
+		if [ -a  `dirname "$pipoFile"` ]; then
+			rm -rf `dirname "$pipoFile"`
+		fi
+		mkdir -p `dirname "$pipoFile"`
+	fi
+	if ! [ -p "$pipoFile" ]; then
+		if [ -a  "$pipoFile" ]; then
+			rm -rf "$pipoFile"
+		fi
+		mkfifo -m 0666 "$pipoFile"
+	fi
+	if [ -p "$pipoFile" ]; then
+		return 0
+	else
+		return 1
+	fi
+
+}
+
+startInotifywait() {
+	if [ `pgrep -u root inotifywait | wc -l` != 0 ]; then
+		echo "Inotifywait already started!"
+		return 0
+	fi
+	touchPipo "$inotifywaitPipo"
+	inotifywait -drq -o "$inotifywaitPipo" --format "%w;%e;%f" -e create,move,delete,modify "$sourceDir"
+	if [ $? == 0 ]; then
+		echo "Inotifywait start successfully!"
+		return 0
+	else
+		echo "Inotifywait start failed!"
+		return 1
+	fi
+	
+}
+
+stopInotifywait() {
+	failed=false
+	if [ `pgrep -u root inotifywait | wc -l` != 0 ]; then
+		kill -s 9 `pgrep -u root inotifywait`
+		if [ $? != 0 ]; then
+			failed=true
+		fi
+	else
+		echo "Inotifywait is not start!"
+		return 1
+	fi
+	if [ $failed == false ]; then
+		echo "Inotifywait stop successfully!"
+		return 0
+	else
+		echo "Inotifywait stop failed!"
+		return 1
+	fi
+}
+
+returnIsyncPid() {
+	pid=0
+	if [ -f "$isyncPid" ]; then
+		if [ "`ps -ef | grep $0 | grep $(cat $isyncPid) | grep -v $$ | wc -l`" != "0" ]; then	
+			pid=`cat "$isyncPid"`
+		else
+			rm -f "$isyncPid"
+		fi
+	fi
+	echo "$pid"
+}
+
+startIsync() {
+	pid=`returnIsyncPid`
+	if [ "$pid" != "0" ]; then
+		echo "Isync already started!"
+		return 1
+	else
+		echo "Isync is starting!"
+		echo "$$" > "$isyncPid"
+	fi
+	touchPipo "$isyncPipo"
+	exec 6<> "$isyncPipo"
+	for (( i=0;i<$threadNo;i++ )); do
+		echo
+	done >&6
+
+	IFS=';'
+	while true; do
+	if read watchDIR watchEvent watchFile; then
+		read -u 6;
+		{
+		syncSourcet="$watchDIR$watchFile"
+		if [ "$sourceDir" == "$targetDir" ]; then
+			syncTarget="$watchDIR$watchFile"
+		else
+			syncTarget=`echo "$watchDIR" | sed -e "s~$sourceDir~$targetDir~g"`"$watchFile"
+		fi
+	
+		for i in $targetServers; do
+			targetSer="$i"
+			msgFormat="$watchEvent"' "'"$targetSer"':'"$syncTarget"'"'
+
+			finsh=false
+			for ((;;)); do
+				execRsync "$syncTarget" "$targetSer" "$syncTarget" "$watchEvent"
+				if [ $? -eq 0 ]; then finsh=true; break; fi
+			done
+			if [ $finsh == true ]; then
+				echo `date +"%Y-%m-%d %H:%M:%S"`' '"$msgFormat"' successfully!' | tee -a "$isyncLog"
+			else
+				echo `date +"%Y-%m-%d %H:%M:%S"`' '"$msgFormat"' failed!' | tee -a "$isyncLog"
+			fi
+			continue
+		done
+		echo >&6
+		}&
+	fi
+	sleep 0.01s
+	done < "$inotifywaitPipo"
+	wait
+	exec 6>&-
+}
+
+stopIsync() {
+	failed=false
+	pid=`returnIsyncPid`
+	if [ "$pid" == "0" ]; then
+		echo "Isync is not start!"
+		return 1
+	else
+		kill -s 9 "$pid" > /dev/null 2>&1
+		if [ $? == 0 ]; then
+			rm -f "$isyncPid"
+		else
+			failed=true
+		fi
+	fi
+	if [ $failed == false ]; then
+		echo "Isync stop successfully!"
+		return 0
+	else
+		echo "Isync stop failed!"
+		return 1
+	fi
+}
+
+case "$1" in
+	start)
+		case "$2" in
+			inotifywait)
+				startInotifywait
+				;;
+			isync)
+				startIsync
+				;;
+			*)
+				echo "Usage: $0 start {inotifywait|isync}"
+				;;
+		esac
+		;;
+	stop)
+		case "$2" in
+			inotifywait)
+				stopInotifywait
+				;;
+			isync)
+				stopIsync
+				;;
+			*)
+				echo "Usage: $0 stop {inotifywait|isync}"
+				;;
+		esac
+		;;
+	restart)
+		case "$2" in
+			inotifywait)
+				stopInotifywait
+				startInotifywait
+				;;
+			isync)
+				stopIsync
+				startIsync
+				;;
+			*)
+				echo "Usage: $0 restart {inotifywait|isync}"
+				;;
+		esac
+		;;
+	status)
+		case "$2" in
+			inotifywait)
+				if [ `pgrep -u root inotifywait | wc -l` != 0 ]; then
+					echo "Inotifywait is started!"
+				else
+					echo "Inotifywait is not running!"
+				fi
+				;;
+			isync)
+				pid=`returnIsyncPid`
+				if [ "$pid" != "0" ]; then
+					echo "Isync is started!"
+				else
+					echo "Isync is not running!"
+				fi
+				;;
+			*)
+				echo "Usage: $0 status {inotifywait|isync}"
+				;;
+		esac
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status}"
+		;;
+esac
+exit 0
