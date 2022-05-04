@@ -159,9 +159,9 @@ startIsync() {
 				if [ $? -eq 0 ]; then finsh=true; break; fi
 			done
 			if [ $finsh == true ]; then
-				echo `date +"%Y-%m-%d %H:%M:%S"`' '"$msgFormat"' successfully!' | tee -a "$isyncLog"
+				echo `date +"%Y-%m-%d %H:%M:%S"`' '"$msgFormat"' successfully!' >> "$isyncLog"
 			else
-				echo `date +"%Y-%m-%d %H:%M:%S"`' '"$msgFormat"' failed!' | tee -a "$isyncLog"
+				echo `date +"%Y-%m-%d %H:%M:%S"`' '"$msgFormat"' failed!' >> "$isyncLog"
 			fi
 			continue
 		done
